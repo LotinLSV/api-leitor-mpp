@@ -111,6 +111,7 @@ async def ler_arquivo_mpp(file: UploadFile = File(...)):
                 })
                 
         dados_projeto = {
+            "nome_projeto": project.getProjectProperties().getName() if project.getProjectProperties() and project.getProjectProperties().getName() else "Projeto sem nome",
             "nome_arquivo": file.filename,
             "total_tarefas": len(tarefas),
             "tarefas": tarefas
