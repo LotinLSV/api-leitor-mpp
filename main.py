@@ -38,7 +38,7 @@ def parse_mpp_file(file_path: str, filename: str) -> dict:
     
     # Percorre todas as tarefas do projeto
     for task in project.getTasks():
-        # Ignora tarefas nulas/vazias ou a tarefa raiz (ID 0 / Summary Project Task)
+        # Ignora tarefas nulas/vazias ou a tarefa raiz (ID 0)
         if task is None or not task.getName() or task.getID().intValue() == 0:
             continue
 
@@ -50,35 +50,39 @@ def parse_mpp_file(file_path: str, filename: str) -> dict:
         parent_id = parent_task.getID().intValue() if (parent_task and parent_task.getID().intValue() != 0) else None
         parent_name = str(parent_task.getName()) if (parent_task and parent_task.getID().intValue() != 0) else None
 
-        # --- 2. PREDECESSORAS E SUCESSORAS ---
+        # --- 2. PREDECESSORAS E SUCESSORAS (CORRIGIDO) ---
         predecessoras = []
         if task.getPredecessors():
             for rel in task.getPredecessors():
-                target_task = rel.getTargetTask()
-                if target_task:
+                pred_task = rel.getPredecessorTask()
+                if pred_task:
                     predecessoras.append({
-                        "task_id": target_task.getID().intValue(),
-                        "task_name": str(target_task.getName()),
-                        "tipo_relacao": str(rel.getType())  # ex: FINISH_START
+                        "task_id": pred_task.getID().intValue(),
+                        "task_name": str(pred_task.getName()),
+                        "tipo_relacao": str(rel.getType())
                     })
 
         sucessoras = []
         if task.getSuccessors():
             for rel in task.getSuccessors():
-                target_task = rel.getTargetTask()
-                if target_task:
+                succ_task = rel.getSuccessorTask()
+                if succ_task:
                     sucessoras.append({
-                        "task_id": target_task.getID().intValue(),
-                        "task_name": str(target_task.getName()),
+                        "task_id": succ_task.getID().intValue(),
+                        "task_name": str(succ_task.getName()),
                         "tipo_relacao": str(rel.getType())
                     })
+
+        # Porcentagem de conclusão da tarefa
+        pct_task = task.getPercentageComplete()
+        pct_task_value = float(pct_task.doubleValue()) if pct_task is not None else 0.0
 
         # --- 3. MONTAGEM DO DICIONÁRIO DA TAREFA ---
         tarefa_dict = {
             "id": task.getID().intValue(),
             "wbs": str(task.getWBS()) if task.getWBS() else "",
             "nome": str(task.getName()),
-            "percentual_concluido": float(task.getPercentComplete() or 0),
+            "percentual_concluido": pct_task_value,
             
             # Estrutura Hierárquica
             "hierarquia": {
@@ -108,13 +112,16 @@ def parse_mpp_file(file_path: str, filename: str) -> dict:
 
         lista_tarefas.append(tarefa_dict)
 
-    # Estrutura consolidada do projeto
+    # Porcentagem total do projeto
+    pct_proj = properties.getPercentageComplete()
+    pct_proj_value = float(pct_proj.doubleValue()) if pct_proj is not None else 0.0
+
     return {
         "nome_arquivo": filename,
         "titulo_projeto": str(properties.getProjectTitle() or filename),
         "data_inicio_projeto": format_date(properties.getStartDate()),
         "data_fim_projeto": format_date(properties.getFinishDate()),
-        "percentual_concluido_total": float(properties.getPercentComplete() or 0),
+        "percentual_concluido_total": pct_proj_value,
         "total_tarefas": len(lista_tarefas),
         "tarefas": lista_tarefas
     }
