@@ -1,6 +1,6 @@
 import os
 import json
-from typing import List, Optional
+from typing import List, Optional, Dict
 from fastapi import FastAPI, UploadFile, File, HTTPException
 import jpype
 import mpxj
