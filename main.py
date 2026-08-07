@@ -3,20 +3,22 @@ import json
 from typing import List, Optional
 from fastapi import FastAPI, UploadFile, File, HTTPException
 import jpype
-import mpxj  # Importa o mpxj para garantir os caminhos dos JARs Java
+import mpxj
 
-# 1. INICIE A JVM PRIMEIRO
+# 1. A JVM PRECISA SER INICIADA ANTES DE IMPORTAR OS PACOTES JAVA (org.*)
 if not jpype.isJVMStarted():
-    jpype.startJVM()
+    # Passa o classpath do mpxj para a JVM se necessário ou usa a inicialização padrão
+    jpype.startJVM(jpype.getDefaultJVMPath())
 
-# 2. SOMENTE APÓS A JVM ESTAR RODANDO, IMPORTE AS CLASSES JAVA
-from org.mpxj.mpp import MPPReader  # type: ignore
+# 2. SOMENTE APÓS A JVM ESTAR RODANDO, FAÇA A IMPORTAÇÃO DO MPXJ
+from org.mpxj.mpp import MPPReader # type: ignore
 
 app = FastAPI(
     title="API Leitor MPP", 
     description="Lê arquivos do Microsoft Project (.mpp) e retorna JSON estruturado"
 )
 
+# ... seu código dos endpoints continua aqui ...
 
 
 # ... restante do seu código

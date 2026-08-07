@@ -19,4 +19,4 @@ COPY main.py /app/main.py
 EXPOSE 80
 
 # Comando para rodar a API usando o Uvicorn na porta 80
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "80"]
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-80}"]
