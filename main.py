@@ -5,96 +5,153 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 import jpype
 import mpxj
 
-# 1. A JVM PRECISA SER INICIADA ANTES DE IMPORTAR OS PACOTES JAVA (org.*)
+# 1. Inicia a JVM se ainda não estiver rodando
 if not jpype.isJVMStarted():
-    # Passa o classpath do mpxj para a JVM se necessário ou usa a inicialização padrão
-    jpype.startJVM(jpype.getDefaultJVMPath())
+    jpype.startJVM()
 
-# 2. SOMENTE APÓS A JVM ESTAR RODANDO, FAÇA A IMPORTAÇÃO DO MPXJ
-from org.mpxj.mpp import MPPReader # type: ignore
+# 2. Imports das classes Java do MPXJ
+from org.mpxj.mpp import MPPReader  # type: ignore
 
 app = FastAPI(
-    title="API Leitor MPP", 
-    description="Lê arquivos do Microsoft Project (.mpp) e retorna JSON estruturado"
+    title="API Central de Projetos MPP", 
+    description="Extrai dados detalhados de arquivos .mpp incluindo hierarquia, dependências e baseline."
 )
 
-# ... seu código dos endpoints continua aqui ...
-
-
-# ... restante do seu código
-
-# Banco de dados em memória temporária para guardar os dados processados
-# (Para produção persistente, considere conectar a um banco como PostgreSQL/SQLite)
+# Banco de dados temporário em memória
 DB_PROJETOS: Dict[str, dict] = {}
 
 
-@app.post("/ler-mpp/")
-async def ler_arquivo_mpp(file: UploadFile = File(...)):
-    if not (file.filename.endswith(".mpp") or file.filename.endswith(".xml")):
-        raise HTTPException(status_code=400, detail="Envie um arquivo .mpp ou .xml válido.")
-    
-    temp_path = f"temp_{file.filename}"
-    with open(temp_path, "wb") as buffer:
-        content = await file.read()
-        buffer.write(content)
-        
-    try:
-        reader = MPPReader()
-        project = reader.read(temp_path)
-        
-        tarefas = []
-        for task in project.getTasks():
-            nome_tarefa = str(task.getName()).strip() if task.getName() is not None else ""
-            
-            if nome_tarefa:
-                duracao = task.getDuration()
-                duracao_valor = duracao.getDuration() if duracao else 0
-                duracao_unidade = str(duracao.getUnits()) if duracao else "Days"
+def format_date(java_date) -> Optional[str]:
+    """Auxiliar para converter objetos de data do Java/MPXJ para string ISO"""
+    if java_date is None:
+        return None
+    return str(java_date)
 
-                tarefas.append({
-                    "id": task.getID(),
-                    "unique_id": task.getUniqueID(),
-                    "nome_arquivo": file.filename,
-                    "taskname": nome_tarefa,
-                    "inicio": str(task.getStart()) if task.getStart() else None,
-                    "termino": str(task.getFinish()) if task.getFinish() else None,
-                    "percentual_concluido": float(task.getPercentageComplete()) if task.getPercentageComplete() else 0.0,
-                    "duracao": duracao_valor,
-                    "unidade_duracao": duracao_unidade,
-                    "custo": float(task.getCost()) if task.getCost() else 0.0,
-                    "eh_critico": bool(task.getCritical())
-                })
-                
-        dados_projeto = {
-            "nome_arquivo": file.filename,
-            "total_tarefas": len(tarefas),
-            "tarefas": tarefas
-        }
+
+def parse_mpp_file(file_path: str, filename: str) -> dict:
+    reader = MPPReader()
+    project = reader.read(file_path)
+    
+    properties = project.getProjectProperties()
+    
+    lista_tarefas = []
+    
+    # Percorre todas as tarefas do projeto
+    for task in project.getTasks():
+        # Ignora tarefas nulas/vazias ou a tarefa raiz (ID 0 / Summary Project Task)
+        if task is None or not task.getName() or task.getID().intValue() == 0:
+            continue
+
+        # --- 1. HIERARQUIA (Mãe / Filha / Nível) ---
+        outline_level = task.getOutlineLevel().intValue() if task.getOutlineLevel() else 0
+        is_summary = task.getSummary()  # True se for tarefa Mãe (Resumo)
         
-        # Grava os dados no DB em memória chaveado pelo nome do arquivo
+        parent_task = task.getParentTask()
+        parent_id = parent_task.getID().intValue() if (parent_task and parent_task.getID().intValue() != 0) else None
+        parent_name = str(parent_task.getName()) if (parent_task and parent_task.getID().intValue() != 0) else None
+
+        # --- 2. PREDECESSORAS E SUCESSORAS ---
+        predecessoras = []
+        if task.getPredecessors():
+            for rel in task.getPredecessors():
+                target_task = rel.getTargetTask()
+                if target_task:
+                    predecessoras.append({
+                        "task_id": target_task.getID().intValue(),
+                        "task_name": str(target_task.getName()),
+                        "tipo_relacao": str(rel.getType())  # ex: FINISH_START
+                    })
+
+        sucessoras = []
+        if task.getSuccessors():
+            for rel in task.getSuccessors():
+                target_task = rel.getTargetTask()
+                if target_task:
+                    sucessoras.append({
+                        "task_id": target_task.getID().intValue(),
+                        "task_name": str(target_task.getName()),
+                        "tipo_relacao": str(rel.getType())
+                    })
+
+        # --- 3. MONTAGEM DO DICIONÁRIO DA TAREFA ---
+        tarefa_dict = {
+            "id": task.getID().intValue(),
+            "wbs": str(task.getWBS()) if task.getWBS() else "",
+            "nome": str(task.getName()),
+            "percentual_concluido": float(task.getPercentComplete() or 0),
+            
+            # Estrutura Hierárquica
+            "hierarquia": {
+                "nivel_estrutura": outline_level,
+                "e_tarefa_mae": bool(is_summary),
+                "e_tarefa_filha": not bool(is_summary) and outline_level > 1,
+                "id_tarefa_pai": parent_id,
+                "nome_tarefa_pai": parent_name
+            },
+
+            # Datas Planejadas / Atuais
+            "datas": {
+                "inicio_planejado": format_date(task.getStart()),
+                "termino_planejado": format_date(task.getFinish()),
+                # Início e Término Real (Executado)
+                "inicio_real": format_date(task.getActualStart()),
+                "termino_real": format_date(task.getActualFinish()),
+                # Linha de Base 0 (Baseline Principal)
+                "baseline_inicio": format_date(task.getBaselineStart()),
+                "baseline_termino": format_date(task.getBaselineFinish())
+            },
+
+            # Relacionamentos
+            "predecessoras": predecessoras,
+            "sucessoras": sucessoras
+        }
+
+        lista_tarefas.append(tarefa_dict)
+
+    # Estrutura consolidada do projeto
+    return {
+        "nome_arquivo": filename,
+        "titulo_projeto": str(properties.getProjectTitle() or filename),
+        "data_inicio_projeto": format_date(properties.getStartDate()),
+        "data_fim_projeto": format_date(properties.getFinishDate()),
+        "percentual_concluido_total": float(properties.getPercentComplete() or 0),
+        "total_tarefas": len(lista_tarefas),
+        "tarefas": lista_tarefas
+    }
+
+
+@app.post("/projetos/upload", summary="Processa o arquivo .mpp e salva os dados detalhados")
+async def upload_projeto(file: UploadFile = File(...)):
+    if not file.filename.endswith(('.mpp', '.xml')):
+        raise HTTPException(status_code=400, detail="Apenas arquivos .mpp e .xml são aceitos.")
+
+    temp_path = f"/tmp/{file.filename}"
+    try:
+        with open(temp_path, "wb") as buffer:
+            buffer.write(await file.read())
+        
+        dados_projeto = parse_mpp_file(temp_path, file.filename)
+        
+        # Salva ou atualiza no dicionário centralizador pelo nome do arquivo
         DB_PROJETOS[file.filename] = dados_projeto
         
-        return dados_projeto
-
+        return {
+            "status": "sucesso", 
+            "mensagem": f"Projeto '{file.filename}' processado com sucesso.",
+            "total_tarefas_extraidas": dados_projeto["total_tarefas"]
+        }
+        
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erro ao processar arquivo: {str(e)}")
-    
+        raise HTTPException(status_code=500, detail=f"Erro ao processar o arquivo MPP: {str(e)}")
+        
     finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)
 
 
-# ------------------------------------------------------------------
-# NOVO ENDPOINT GET PARA O POWER BI CONSUMIR
-# ------------------------------------------------------------------
-@app.get("/projetos/")
-async def obter_todos_projetos():
-    """
-    Retorna uma lista consolidada de todas as tarefas cadastradas.
-    Este endpoint é lido nativamente pelo Power BI através do conector Web.
-    """
-    todas_tarefas = []
-    for nome_arquivo, projeto in DB_PROJETOS.items():
-        todas_tarefas.extend(projeto["tarefas"])
-        
-    return todas_tarefas
+@app.get("/projetos/central", summary="Retorna a Central com todos os Projetos e suas Tarefas")
+def obter_central_de_projetos():
+    return {
+        "quantidade_projetos": len(DB_PROJETOS),
+        "projetos": list(DB_PROJETOS.values())
+    }
