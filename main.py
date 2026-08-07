@@ -1,20 +1,25 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Body
-from fastapi.responses import FileResponse
-import jpype
-import json
 import os
-from typing import List, Optional, Dict
-from pydantic import BaseModel
+import json
+from typing import List, Optional
+from fastapi import FastAPI, UploadFile, File, HTTPException
+import jpype
+import mpxj  # Importa o mpxj para garantir os caminhos dos JARs Java
 
+# 1. INICIE A JVM PRIMEIRO
 if not jpype.isJVMStarted():
     jpype.startJVM()
 
-from org.mpxj.mpp import MPPReader # type: ignore
+# 2. SOMENTE APÓS A JVM ESTAR RODANDO, IMPORTE AS CLASSES JAVA
+from org.mpxj.mpp import MPPReader  # type: ignore
 
 app = FastAPI(
-    title="API Leitor e Gravador MPP", 
-    description="Lê arquivos .mpp/.xml e fornece dados em formato REST para Power Automate e Power BI"
+    title="API Leitor MPP", 
+    description="Lê arquivos do Microsoft Project (.mpp) e retorna JSON estruturado"
 )
+
+
+
+# ... restante do seu código
 
 # Banco de dados em memória temporária para guardar os dados processados
 # (Para produção persistente, considere conectar a um banco como PostgreSQL/SQLite)
