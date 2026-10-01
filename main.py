@@ -6,6 +6,12 @@ from datetime import datetime
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 import jpype
+import mpxj  # <-- ESSENCIAL: carrega o JAR do MPXJ no classpath
+
+if not jpype.isJVMStarted():
+    jpype.startJVM()
+
+from org.mpxj.mpp import MPPReader  # type: ignore
 
 # 1. Inicia a JVM
 if not jpype.isJVMStarted():
