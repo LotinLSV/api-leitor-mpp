@@ -1,0 +1,11 @@
+.git
+.gitignore
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+mpxj.jar
+*.xlsx
+dados_mpp.json
+temp_*
