@@ -119,7 +119,14 @@ def safe_date(value: Any) -> Optional[str]:
 # INICIA JVM (MPXJ)
 # ------------------------------------------------------------------
 if not jpype.isJVMStarted():
-    jpype.startJVM()
+    jpype.startJVM(classpath=[
+        "/app/libs/mpxj.jar",
+        "/app/libs/mpxj-deps.jar",
+    ])
+
+
+# if not jpype.isJVMStarted():
+#     jpype.startJVM()
 
 from org.mpxj.mpp import MPPReader          # type: ignore
 from org.mpxj import RelationType           # type: ignore
