@@ -421,7 +421,7 @@ COLUNAS_SHAREPOINT = [
     "InicioReal", "TerminoReal", "PercentualConcluido", "Duracao",
     "UnidadeDuracao", "CustoPrevisto", "CustoRealizado", "EhMarco",
     "EhCritico", "TipoHierarquia", "IdTarefaMae", "NomeTarefaMae",
-    "Recursos", "Notas", "DataProcessamento",
+    "Recursos", "Notas", "DataProcessamento", baseline_inicio, baseline_termino, baseline_custo, 
 ]
 
 
