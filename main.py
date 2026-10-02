@@ -16,6 +16,14 @@ from datetime import datetime
 
 import pandas as pd
 
+
+
+import jpype
+import jpype.imports   # habilita "from org.xxx import ..."
+import mpxj            # registra os JARs do pacote no classpath (antes do startJVM)
+
+
+
 # ------------------------------------------------------------------
 # CONFIGURAÇÃO
 # ------------------------------------------------------------------
@@ -118,26 +126,22 @@ def safe_date(value: Any) -> Optional[str]:
 # ------------------------------------------------------------------
 # INICIA JVM (MPXJ)
 # ------------------------------------------------------------------
-# if not jpype.isJVMStarted():
-#     jpype.startJVM(classpath=[
-#         "/app/libs/mpxj.jar",
-#         "/app/libs/mpxj-deps.jar",
-#     ])
+
+
+JVM_OPTS = os.getenv(
+    "JVM_OPTS", "-Xms32m -Xmx192m -XX:+UseSerialGC -Djava.awt.headless=true"
+).split()
 
 if not jpype.isJVMStarted():
-    jpype.startJVM(
-        "-Xms64m",
-        "-Xmx320m",
-        "-XX:+UseSerialGC",
-        classpath=["/app/libs/mpxj.jar"],
-    )
+    jpype.startJVM(*JVM_OPTS)
+
+from org.mpxj.mpp import MPPReader   # type: ignore
+from org.mpxj import RelationType    # type: ignore
 
 
-# if not jpype.isJVMStarted():
-#     jpype.startJVM()
 
-from org.mpxj.mpp import MPPReader          # type: ignore
-from org.mpxj import RelationType           # type: ignore
+
+
 
 
 # ------------------------------------------------------------------
