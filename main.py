@@ -1,146 +1,208 @@
-import os
-import json
-import hashlib
-from typing import List, Optional, Dict, Any
-from datetime import datetime
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query
+# main.py
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 import jpype
-import mpxj  # <-- ESSENCIAL: carrega o JAR do MPXJ no classpath
+import json
+import os
+import uuid
+import io
+import csv
+import base64
+import hashlib
+from typing import List, Optional, Any
+from pydantic import BaseModel
+from datetime import datetime
 
-if not jpype.isJVMStarted():
-    jpype.startJVM()
-
-from org.mpxj.mpp import MPPReader  # type: ignore
-
-# 1. Inicia a JVM
-if not jpype.isJVMStarted():
-    jpype.startJVM()
-
-from org.mpxj.mpp import MPPReader  # type: ignore
-
-app = FastAPI(
-    title="API Central de Projetos MPP",
-    description="Extrai TODOS os dados de arquivos .mpp: hierarquia, datas, custos, recursos, baseline e relacionamentos."
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+import pandas as pd
 
 # ------------------------------------------------------------------
-# PERSISTÊNCIA EM DISCO (sobrevive a restart)
+# CONFIGURAÇÃO
 # ------------------------------------------------------------------
+API_KEY = os.getenv("API_KEY", "troque-esta-chave-em-producao")
 ARQUIVO_DADOS = "dados_mpp.json"
 
-def carregar_dados() -> Dict[str, dict]:
+
+# ------------------------------------------------------------------
+# AUTENTICAÇÃO SIMPLES VIA HEADER
+# ------------------------------------------------------------------
+async def verificar_api_key(x_api_key: str = Header(...)):
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="API Key inválida")
+    return True
+
+
+# ------------------------------------------------------------------
+# HELPERS DE ID
+# ------------------------------------------------------------------
+def gerar_id_projeto(nome_arquivo: str) -> str:
+    return hashlib.md5(nome_arquivo.encode("utf-8")).hexdigest()[:12]
+
+
+# ------------------------------------------------------------------
+# PERSISTÊNCIA
+# ------------------------------------------------------------------
+def carregar_dados():
     if os.path.exists(ARQUIVO_DADOS):
         with open(ARQUIVO_DADOS, "r", encoding="utf-8") as f:
             return json.load(f)
-    return {}
+    return {"projetos": {}, "ultima_atualizacao": None}
 
-def salvar_dados(db: Dict[str, dict]) -> None:
+
+def salvar_dados(dados):
+    dados["ultima_atualizacao"] = datetime.now().isoformat()
     with open(ARQUIVO_DADOS, "w", encoding="utf-8") as f:
-        json.dump(db, f, ensure_ascii=False, indent=2, default=str)
+        json.dump(dados, f, ensure_ascii=False, indent=2, default=str)
 
-DB_PROJETOS: Dict[str, dict] = carregar_dados()
 
 # ------------------------------------------------------------------
-# HELPERS (conversão Java → Python tratando null)
+# HELPERS DE CONVERSÃO JAVA -> PYTHON
 # ------------------------------------------------------------------
-def safe_str(v: Any, default: str = "") -> str:
-    if v is None:
+def safe_str(value: Any, default: str = "") -> str:
+    if value is None:
         return default
     try:
-        s = str(v).strip()
+        s = str(value).strip()
     except Exception:
         return default
-    return default if s.lower() in ("null", "none", "nan") else s
+    if s.lower() in ("null", "none", "nan"):
+        return default
+    return s
 
-def safe_float(v: Any, default: float = 0.0) -> float:
-    if v is None:
+
+def safe_float(value: Any, default: float = 0.0) -> float:
+    if value is None:
         return default
     try:
-        return float(v)
+        return float(value)
     except (TypeError, ValueError):
         return default
 
-def safe_int(v: Any, default: Optional[int] = None) -> Optional[int]:
-    if v is None:
+
+def safe_int(value: Any, default: Optional[int] = None) -> Optional[int]:
+    if value is None:
         return default
     try:
-        return int(v)
+        return int(value)
     except (TypeError, ValueError):
         return default
 
-def safe_bool(v: Any) -> bool:
+
+def safe_bool(value: Any) -> bool:
+    if value is None:
+        return False
     try:
-        return bool(v)
+        return bool(value)
     except Exception:
         return False
 
-def format_date(java_date: Any) -> Optional[str]:
-    """Converte LocalDateTime/LocalDate/java.util.Date em ISO 8601."""
-    if java_date is None:
+
+def safe_date(value: Any) -> Optional[str]:
+    if value is None:
         return None
-    if hasattr(java_date, "toString"):
+    if hasattr(value, "toString"):
         try:
-            s = java_date.toString()
+            s = value.toString()
             if s and s.lower() != "null":
-                if "T" in s and len(s) == 16:      # 2024-01-01T08:00
+                if "T" in s and len(s) == 16:
                     s += ":00"
                 return s
         except Exception:
             pass
     try:
-        return java_date.isoformat()
+        return value.isoformat()
     except Exception:
-        return safe_str(java_date) or None
+        return safe_str(value) or None
 
-def gerar_id_projeto(nome_arquivo: str) -> str:
-    """ID estável entre reinícios (MD5 do nome do arquivo)."""
-    return hashlib.md5(nome_arquivo.encode("utf-8")).hexdigest()[:12]
 
 # ------------------------------------------------------------------
-# EXTRAÇÃO COMPLETA DE UMA TAREFA — 1 linha plana por tarefa
+# INICIA JVM (MPXJ)
 # ------------------------------------------------------------------
-def extrair_tarefa(task, nome_arquivo: str, id_projeto: str, data_proc: str) -> dict:
-    nome = safe_str(task.getName())
+if not jpype.isJVMStarted():
+    jpype.startJVM()
 
-    # ----- Duração -----
-    dur_obj = task.getDuration()
-    duracao = safe_float(dur_obj.getDuration()) if dur_obj else 0.0
-    unidade = safe_str(dur_obj.getUnits()) if dur_obj else "Days"
+from org.mpxj.mpp import MPPReader          # type: ignore
+from org.mpxj import RelationType           # type: ignore
 
-    # ----- Hierarquia -----
-    parent = task.getParentTask()
-    eh_mae = safe_bool(task.getSummary())
-    eh_filha = parent is not None and safe_int(parent.getID(), 0) != 0
 
-    id_pai = safe_int(parent.getID()) if (parent and safe_int(parent.getID(), 0) != 0) else None
-    nome_pai = safe_str(parent.getName()) if (parent and safe_int(parent.getID(), 0) != 0) else None
-    uid_pai = safe_int(parent.getUniqueID()) if (parent and safe_int(parent.getID(), 0) != 0) else None
+# ------------------------------------------------------------------
+# APP
+# ------------------------------------------------------------------
+app = FastAPI(
+    title="API Leitor MPP para Power BI",
+    description="Lê arquivos .mpp, expõe dados em JSON e exporta CSV/XLSX para Power BI",
+    version="3.0",
+)
 
-    if eh_mae:
-        tipo_hier = "mae"
-    elif eh_filha:
-        tipo_hier = "filha"
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ------------------------------------------------------------------
+# MODELOS
+# ------------------------------------------------------------------
+class TarefaUpdate(BaseModel):
+    unique_id: int
+    taskname: Optional[str] = None
+    percentual_concluido: Optional[float] = 0.0
+    duracao: Optional[float] = None
+    inicio: Optional[str] = None
+    termino: Optional[str] = None
+
+
+class ProjetoUpdate(BaseModel):
+    nome_arquivo: str
+    tarefas: List[TarefaUpdate]
+
+
+class ArquivoBase64(BaseModel):
+    filename: str
+    content_base64: str
+
+
+# ------------------------------------------------------------------
+# EXTRAÇÃO COMPLETA DE UMA TAREFA (plana, 1 linha por tarefa)
+# ------------------------------------------------------------------
+def extrair_tarefa(task, project, nome_arquivo: str, id_projeto: str, data_proc: str) -> dict:
+    nome_tarefa = safe_str(task.getName())
+
+    # Duração
+    duracao_obj = task.getDuration()
+    duracao_valor = safe_float(duracao_obj.getDuration()) if duracao_obj else 0.0
+    duracao_unidade = safe_str(duracao_obj.getUnits()) if duracao_obj else "Days"
+
+    # Hierarquia
+    parent_task = task.getParentTask()
+    eh_tarefa_mae = safe_bool(task.getSummary())
+    eh_tarefa_filha = parent_task is not None
+    id_tarefa_mae = safe_int(parent_task.getID()) if parent_task else None
+    unique_id_mae = safe_int(parent_task.getUniqueID()) if parent_task else None
+    nome_tarefa_mae = safe_str(parent_task.getName()) if parent_task and parent_task.getName() else None
+
+    if eh_tarefa_mae:
+        tipo_hierarquia = "mae"
+    elif eh_tarefa_filha:
+        tipo_hierarquia = "filha"
     else:
-        tipo_hier = "independente"
+        tipo_hierarquia = "independente"
 
-    # Nível WBS (outline level)
-    nivel = safe_int(task.getOutlineLevel(), 0) or 0
+    nivel = 0
+    p = parent_task
+    while p is not None:
+        nivel += 1
+        p = p.getParentTask()
 
-    # ----- Recursos -----
+    # Recursos
     recursos = []
     try:
-        for a in task.getResourceAssignments() or []:
+        for assignment in task.getResourceAssignments() or []:
             try:
-                r = a.getResource()
+                r = assignment.getResource()
                 if r and r.getName():
                     recursos.append(safe_str(r.getName()))
             except Exception:
@@ -149,7 +211,7 @@ def extrair_tarefa(task, nome_arquivo: str, id_projeto: str, data_proc: str) -> 
         pass
     recursos_str = "; ".join(recursos)
 
-    # ----- Predecessoras -----
+    # Predecessoras
     predecessoras = []
     try:
         for rel in task.getPredecessors() or []:
@@ -164,7 +226,6 @@ def extrair_tarefa(task, nome_arquivo: str, id_projeto: str, data_proc: str) -> 
                     predecessoras.append({
                         "id": safe_int(pred.getID()),
                         "unique_id": safe_int(pred.getUniqueID()),
-                        "nome": safe_str(pred.getName()),
                         "tipo": safe_str(rel.getType()),
                     })
             except Exception:
@@ -172,7 +233,7 @@ def extrair_tarefa(task, nome_arquivo: str, id_projeto: str, data_proc: str) -> 
     except Exception:
         pass
 
-    # ----- Sucessoras -----
+    # Sucessoras
     sucessoras = []
     try:
         for rel in task.getSuccessors() or []:
@@ -187,7 +248,6 @@ def extrair_tarefa(task, nome_arquivo: str, id_projeto: str, data_proc: str) -> 
                     sucessoras.append({
                         "id": safe_int(suc.getID()),
                         "unique_id": safe_int(suc.getUniqueID()),
-                        "nome": safe_str(suc.getName()),
                         "tipo": safe_str(rel.getType()),
                     })
             except Exception:
@@ -195,96 +255,102 @@ def extrair_tarefa(task, nome_arquivo: str, id_projeto: str, data_proc: str) -> 
     except Exception:
         pass
 
-    # ----- Custos -----
-    custo_previsto  = safe_float(task.getCost())
+    # Custos
+    custo_previsto = safe_float(task.getCost())
     custo_realizado = safe_float(task.getActualCost())
-    custo_restante  = safe_float(task.getRemainingCost())
-    baseline_custo  = safe_float(task.getBaselineCost())
+    custo_restante = safe_float(task.getRemainingCost())
 
-    # ----- Trabalho -----
-    trabalho = 0.0
+    # Trabalho
+    trabalho_horas = 0.0
     try:
         w = task.getWork()
-        if w: trabalho = safe_float(w.getDuration())
+        if w:
+            trabalho_horas = safe_float(w.getDuration())
     except Exception:
         pass
+
     trabalho_real = 0.0
     try:
         aw = task.getActualWork()
-        if aw: trabalho_real = safe_float(aw.getDuration())
+        if aw:
+            trabalho_real = safe_float(aw.getDuration())
     except Exception:
         pass
 
-    # ----- Percentual -----
+    # Percentual
     perc = safe_float(task.getPercentageComplete())
     if 0 < perc <= 1:
         perc *= 100.0
 
-    # ----- Datas -----
-    inicio     = format_date(task.getStart())
-    termino    = format_date(task.getFinish())
-    inicio_r   = format_date(task.getActualStart())
-    termino_r  = format_date(task.getActualFinish())
-    baseline_i = format_date(task.getBaselineStart())
-    baseline_t = format_date(task.getBaselineFinish())
+    # Baseline
+    baseline_inicio = safe_date(task.getBaselineStart())
+    baseline_termino = safe_date(task.getBaselineFinish())
+    baseline_custo = safe_float(task.getBaselineCost())
 
-    # ----- WBS / Notas -----
-    wbs   = safe_str(task.getWBS())
+    # Datas
+    inicio = safe_date(task.getStart())
+    termino = safe_date(task.getFinish())
+    ini_real = safe_date(task.getActualStart())
+    fim_real = safe_date(task.getActualFinish())
+
+    # Texto
+    wbs = safe_str(task.getWBS())
     notas = safe_str(task.getNotes())
 
-    # ==============================================================
-    # SAÍDA PLANA — 21 campos do SharePoint + extras
-    # ==============================================================
     return {
-        # ---- colunas exatas do SharePoint ----
-        "ID Projeto":          id_projeto,
-        "NomeArquivo":         nome_arquivo,
-        "UniqueID":            safe_int(task.getUniqueID()),
-        "Tarefa":              nome,
-        "Inicio":              inicio,
-        "Termino":             termino,
-        "InicioReal":          inicio_r,
-        "TerminoReal":         termino_r,
+        # Chaves exatas para Excel / SharePoint / Power BI
+        "ID Projeto": id_projeto,
+        "NomeArquivo": nome_arquivo,
+        "UniqueID": safe_int(task.getUniqueID()),
+        "Tarefa": nome_tarefa,
+        "Inicio": inicio,
+        "Termino": termino,
+        "InicioReal": ini_real,
+        "TerminoReal": fim_real,
         "PercentualConcluido": perc,
-        "Duracao":             duracao,
-        "UnidadeDuracao":      unidade,
-        "CustoPrevisto":       custo_previsto,
-        "CustoRealizado":      custo_realizado,
-        "EhMarco":             safe_bool(task.getMilestone()),
-        "EhCritico":           safe_bool(task.getCritical()),
-        "TipoHierarquia":      tipo_hier,
-        "IdTarefaMae":         id_pai,
-        "NomeTarefaMae":       nome_pai,
-        "Recursos":            recursos_str,
-        "Notas":               notas,
-        "DataProcessamento":   data_proc,
+        "Duracao": duracao_valor,
+        "UnidadeDuracao": duracao_unidade,
+        "CustoPrevisto": custo_previsto,
+        "CustoRealizado": custo_realizado,
+        "EhMarco": safe_bool(task.getMilestone()),
+        "EhCritico": safe_bool(task.getCritical()),
+        "TipoHierarquia": tipo_hierarquia,
+        "IdTarefaMae": id_tarefa_mae,
+        "NomeTarefaMae": nome_tarefa_mae,
+        "Recursos": recursos_str,
+        "Notas": notas,
+        "DataProcessamento": data_proc,
 
-        # ---- extras úteis no Power BI ----
-        "id":                  safe_int(task.getID()),
-        "wbs":                 wbs,
-        "nivel_estrutura":     nivel,
-        "eh_tarefa_mae":       eh_mae,
-        "eh_tarefa_filha":     eh_filha,
-        "unique_id_mae":       uid_pai,
-        "custo_restante":      custo_restante,
-        "trabalho_horas":      trabalho,
+        # Extras úteis para Power BI
+        "id": safe_int(task.getID()),
+        "wbs": wbs,
+        "nivel_estrutura": nivel,
+        "eh_tarefa_mae": eh_tarefa_mae,
+        "eh_tarefa_filha": eh_tarefa_filha,
+        "unique_id_mae": unique_id_mae,
+        "custo_restante": custo_restante,
+        "trabalho_horas": trabalho_horas,
         "trabalho_real_horas": trabalho_real,
-        "baseline_inicio":     baseline_i,
-        "baseline_termino":    baseline_t,
-        "baseline_custo":      baseline_custo,
-        "predecessoras":       predecessoras,
-        "sucessoras":          sucessoras,
+        "baseline_inicio": baseline_inicio,
+        "baseline_termino": baseline_termino,
+        "baseline_custo": baseline_custo,
+        "predecessoras": predecessoras,
+        "sucessoras": sucessoras,
     }
 
-# ------------------------------------------------------------------
-# PARSER PRINCIPAL DO MPP
-# ------------------------------------------------------------------
-def parse_mpp_file(file_path: str, filename: str) -> dict:
-    reader = MPPReader()
-    project = reader.read(file_path)
 
-    properties = project.getProjectProperties()
-    id_projeto = gerar_id_projeto(filename)
+# ------------------------------------------------------------------
+# FUNÇÃO REUTILIZÁVEL: LER MPP DE UM PATH
+# ------------------------------------------------------------------
+def processar_mpp(temp_path: str, nome_arquivo: str) -> dict:
+    reader = MPPReader()
+    try:
+        reader.setReadPassword("")
+    except Exception:
+        pass
+
+    project = reader.read(temp_path)
+    id_projeto = gerar_id_projeto(nome_arquivo)
     data_proc = datetime.now().isoformat()
 
     tarefas = []
@@ -293,7 +359,6 @@ def parse_mpp_file(file_path: str, filename: str) -> dict:
 
     for task in project.getTasks():
         try:
-            # Pula apenas a linha raiz (ID 0 sem dados)
             tid = safe_int(task.getID(), -1)
             if tid == 0 and not safe_str(task.getName()) and not task.getStart():
                 ignoradas += 1
@@ -302,114 +367,35 @@ def parse_mpp_file(file_path: str, filename: str) -> dict:
             pass
 
         try:
-            tarefas.append(extrair_tarefa(task, filename, id_projeto, data_proc))
+            tarefas.append(extrair_tarefa(task, project, nome_arquivo, id_projeto, data_proc))
         except Exception as e:
             erros.append({"task_id": safe_int(task.getID(), -1), "erro": str(e)})
 
-    pct_proj = properties.getPercentageComplete()
-    pct_proj_val = safe_float(pct_proj.doubleValue()) if pct_proj is not None else 0.0
-
-    return {
+    db = carregar_dados()
+    db["projetos"][nome_arquivo] = {
         "id_projeto": id_projeto,
-        "nome_arquivo": filename,
-        "titulo_projeto": safe_str(properties.getProjectTitle()) or filename,
-        "data_inicio_projeto": format_date(properties.getStartDate()),
-        "data_fim_projeto": format_date(properties.getFinishDate()),
-        "percentual_concluido_total": pct_proj_val,
+        "nome_arquivo": nome_arquivo,
         "total_tarefas": len(tarefas),
         "tarefas_ignoradas": ignoradas,
         "erros_extracao": erros,
         "data_processamento": data_proc,
         "tarefas": tarefas,
     }
+    salvar_dados(db)
 
-# ------------------------------------------------------------------
-# POST /projetos/upload
-# ------------------------------------------------------------------
-@app.post("/projetos/upload", summary="Processa .mpp e salva todos os dados")
-async def upload_projeto(file: UploadFile = File(...)):
-    if not file.filename.lower().endswith((".mpp", ".xml")):
-        raise HTTPException(status_code=400, detail="Apenas arquivos .mpp e .xml são aceitos.")
-
-    temp_path = f"/tmp/{file.filename}"
-    try:
-        with open(temp_path, "wb") as buffer:
-            buffer.write(await file.read())
-
-        dados_projeto = parse_mpp_file(temp_path, file.filename)
-        DB_PROJETOS[file.filename] = dados_projeto
-        salvar_dados(DB_PROJETOS)
-
-        return {
-            "status": "sucesso",
-            "id_projeto": dados_projeto["id_projeto"],
-            "nome_arquivo": file.filename,
-            "total_tarefas_extraidas": dados_projeto["total_tarefas"],
-            "tarefas_ignoradas": dados_projeto["tarefas_ignoradas"],
-            "total_erros": len(dados_projeto["erros_extracao"]),
-            "erros": dados_projeto["erros_extracao"][:10],
-        }
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Erro ao processar o arquivo MPP: {str(e)}")
-    finally:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-
-# ------------------------------------------------------------------
-# GET /projetos/central — visão completa
-# ------------------------------------------------------------------
-@app.get("/projetos/central", summary="Central com todos os projetos e tarefas")
-def obter_central_de_projetos():
     return {
-        "quantidade_projetos": len(DB_PROJETOS),
-        "projetos": list(DB_PROJETOS.values()),
+        "status": "sucesso",
+        "id_projeto": id_projeto,
+        "nome_arquivo": nome_arquivo,
+        "total_tarefas": len(tarefas),
+        "tarefas_ignoradas": ignoradas,
+        "total_erros": len(erros),
+        "erros": erros[:10],
     }
 
-# ------------------------------------------------------------------
-# GET /projetos — resumo (leve, só metadados)
-# ------------------------------------------------------------------
-@app.get("/projetos", summary="Lista resumida dos projetos")
-def listar_projetos():
-    resumo = [
-        {
-            "id_projeto": p.get("id_projeto"),
-            "nome_arquivo": p.get("nome_arquivo"),
-            "titulo_projeto": p.get("titulo_projeto"),
-            "total_tarefas": p.get("total_tarefas"),
-            "data_processamento": p.get("data_processamento"),
-        }
-        for p in DB_PROJETOS.values()
-    ]
-    return {"total_projetos": len(resumo), "projetos": resumo}
 
 # ------------------------------------------------------------------
-# GET /tarefas — tabela plana (ideal para Power BI)
-# ------------------------------------------------------------------
-@app.get("/tarefas", summary="Todas as tarefas de todos os projetos (tabela plana)")
-def listar_tarefas(
-    nome_arquivo: Optional[str] = Query(None),
-    id_projeto: Optional[str] = Query(None),
-    eh_tarefa_mae: Optional[bool] = Query(None),
-    eh_critico: Optional[bool] = Query(None),
-):
-    linhas = []
-    for proj in DB_PROJETOS.values():
-        if nome_arquivo and proj.get("nome_arquivo") != nome_arquivo:
-            continue
-        if id_projeto and str(proj.get("id_projeto")) != str(id_projeto):
-            continue
-        for t in proj.get("tarefas", []):
-            if eh_tarefa_mae is not None and t.get("eh_tarefa_mae") != eh_tarefa_mae:
-                continue
-            if eh_critico is not None and t.get("EhCritico") != eh_critico:
-                continue
-            linhas.append(t)
-    return {"total_registros": len(linhas), "tarefas": linhas}
-
-# ------------------------------------------------------------------
-# GET /tarefas-sharepoint — só as 21 colunas exatas
+# COLUNAS PADRÃO PARA EXPORTAÇÃO
 # ------------------------------------------------------------------
 COLUNAS_SHAREPOINT = [
     "ID Projeto", "NomeArquivo", "UniqueID", "Tarefa", "Inicio", "Termino",
@@ -419,30 +405,209 @@ COLUNAS_SHAREPOINT = [
     "Recursos", "Notas", "DataProcessamento",
 ]
 
-@app.get("/tarefas-sharepoint", summary="Tarefas no formato exato do SharePoint")
-def tarefas_sharepoint(nome_arquivo: Optional[str] = Query(None)):
+
+# ------------------------------------------------------------------
+# 1. LEITURA (POST multipart)
+# ------------------------------------------------------------------
+@app.post("/ler-mpp/")
+async def ler_arquivo_mpp(file: UploadFile = File(...)):
+    if not file.filename.lower().endswith(".mpp"):
+        raise HTTPException(status_code=400, detail="Envie um arquivo com extensão .mpp válido.")
+
+    temp_path = f"temp_{uuid.uuid4().hex}_{file.filename}"
+    with open(temp_path, "wb") as buffer:
+        buffer.write(await file.read())
+
+    try:
+        return processar_mpp(temp_path, file.filename)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Erro ao processar arquivo MPP: {str(e)}")
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+# ------------------------------------------------------------------
+# 2. LEITURA (POST Base64 — recomendado para Power Automate)
+# ------------------------------------------------------------------
+@app.post("/ler-mpp-base64/")
+async def ler_mpp_base64(payload: ArquivoBase64):
+    if not payload.filename.lower().endswith(".mpp"):
+        raise HTTPException(status_code=400, detail="Arquivo precisa ser .mpp")
+
+    temp_path = f"temp_{uuid.uuid4().hex}_{payload.filename}"
+    try:
+        with open(temp_path, "wb") as f:
+            f.write(base64.b64decode(payload.content_base64))
+
+        return processar_mpp(temp_path, payload.filename)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Erro ao processar arquivo MPP: {str(e)}")
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+# ------------------------------------------------------------------
+# 3. CONSUMO (GET) — JSON completo
+# ------------------------------------------------------------------
+@app.get("/tarefas/")
+async def listar_todas_tarefas(
+    nome_arquivo: Optional[str] = Query(None),
+    eh_tarefa_mae: Optional[bool] = Query(None),
+    eh_critico: Optional[bool] = Query(None),
+    id_projeto: Optional[str] = Query(None),
+):
+    db = carregar_dados()
+    todas_tarefas = []
+    for projeto_nome, projeto_data in db.get("projetos", {}).items():
+        for t in projeto_data.get("tarefas", []):
+            if nome_arquivo and t.get("NomeArquivo") != nome_arquivo:
+                continue
+            if id_projeto and str(t.get("ID Projeto")) != str(id_projeto):
+                continue
+            if eh_tarefa_mae is not None and t.get("eh_tarefa_mae") != eh_tarefa_mae:
+                continue
+            if eh_critico is not None and t.get("EhCritico") != eh_critico:
+                continue
+            todas_tarefas.append(t)
+    return {
+        "total_registros": len(todas_tarefas),
+        "ultima_atualizacao": db.get("ultima_atualizacao"),
+        "tarefas": todas_tarefas,
+    }
+
+
+@app.get("/projetos/")
+async def listar_projetos():
+    db = carregar_dados()
+    resumo = []
+    for nome, dados in db.get("projetos", {}).items():
+        resumo.append({
+            "id_projeto": dados.get("id_projeto"),
+            "nome_arquivo": nome,
+            "total_tarefas": dados.get("total_tarefas", 0),
+            "tarefas_ignoradas": dados.get("tarefas_ignoradas", 0),
+            "data_processamento": dados.get("data_processamento"),
+        })
+    return {"total_projetos": len(resumo), "projetos": resumo}
+
+
+@app.get("/projetos/{nome_arquivo}/tarefas/")
+async def tarefas_por_projeto(nome_arquivo: str):
+    db = carregar_dados()
+    projeto = db.get("projetos", {}).get(nome_arquivo)
+    if not projeto:
+        raise HTTPException(status_code=404, detail=f"Projeto '{nome_arquivo}' não encontrado.")
+    return {
+        "nome_arquivo": nome_arquivo,
+        "id_projeto": projeto.get("id_projeto"),
+        "total_tarefas": projeto.get("total_tarefas", 0),
+        "data_processamento": projeto.get("data_processamento"),
+        "tarefas": projeto.get("tarefas", []),
+    }
+
+
+@app.get("/health/")
+async def health_check():
+    db = carregar_dados()
+    return {
+        "status": "online",
+        "total_projetos": len(db.get("projetos", {})),
+        "ultima_atualizacao": db.get("ultima_atualizacao"),
+    }
+
+
+@app.delete("/projetos/{nome_arquivo}/")
+async def deletar_projeto(nome_arquivo: str):
+    db = carregar_dados()
+    if nome_arquivo in db.get("projetos", {}):
+        del db["projetos"][nome_arquivo]
+        salvar_dados(db)
+        return {"status": "deletado", "nome_arquivo": nome_arquivo}
+    raise HTTPException(status_code=404, detail="Projeto não encontrado.")
+
+
+# ------------------------------------------------------------------
+# 4. FORMATO PLANO (para Power BI / Excel / SharePoint)
+# ------------------------------------------------------------------
+@app.get("/tarefas-sharepoint/")
+async def tarefas_sharepoint(nome_arquivo: Optional[str] = Query(None)):
+    db = carregar_dados()
     linhas = []
-    for proj in DB_PROJETOS.values():
-        if nome_arquivo and proj.get("nome_arquivo") != nome_arquivo:
+    for proj_nome, proj in db.get("projetos", {}).items():
+        if nome_arquivo and proj_nome != nome_arquivo:
             continue
         for t in proj.get("tarefas", []):
             linhas.append({col: t.get(col) for col in COLUNAS_SHAREPOINT})
     return {"total": len(linhas), "colunas": COLUNAS_SHAREPOINT, "linhas": linhas}
 
-# ------------------------------------------------------------------
-# GET /health
-# ------------------------------------------------------------------
-@app.get("/health")
-def health():
-    return {"status": "online", "total_projetos": len(DB_PROJETOS)}
 
 # ------------------------------------------------------------------
-# DELETE /projetos/{nome_arquivo}
+# 5. EXPORT CSV (leve e rápido)
 # ------------------------------------------------------------------
-@app.delete("/projetos/{nome_arquivo}", summary="Remove um projeto da base")
-def deletar_projeto(nome_arquivo: str):
-    if nome_arquivo in DB_PROJETOS:
-        del DB_PROJETOS[nome_arquivo]
-        salvar_dados(DB_PROJETOS)
-        return {"status": "deletado", "nome_arquivo": nome_arquivo}
-    raise HTTPException(status_code=404, detail="Projeto não encontrado.")
+@app.get("/export/csv/", dependencies=[Depends(verificar_api_key)])
+async def export_csv(nome_arquivo: Optional[str] = Query(None)):
+    db = carregar_dados()
+    output = io.StringIO()
+    writer = csv.DictWriter(
+        output,
+        fieldnames=COLUNAS_SHAREPOINT,
+        extrasaction="ignore",
+        lineterminator="\n",
+    )
+    writer.writeheader()
+
+    for proj in db.get("projetos", {}).values():
+        if nome_arquivo and proj.get("nome_arquivo") != nome_arquivo:
+            continue
+        for t in proj.get("tarefas", []):
+            writer.writerow({col: t.get(col, "") for col in COLUNAS_SHAREPOINT})
+
+    output.seek(0)
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": "attachment; filename=cronogramas.csv"},
+    )
+
+
+# ------------------------------------------------------------------
+# 6. EXPORT XLSX (Excel real, com tipos)
+# ------------------------------------------------------------------
+@app.get("/export/xlsx/", dependencies=[Depends(verificar_api_key)])
+async def export_xlsx(nome_arquivo: Optional[str] = Query(None)):
+    db = carregar_dados()
+    linhas = []
+    for proj in db.get("projetos", {}).values():
+        if nome_arquivo and proj.get("nome_arquivo") != nome_arquivo:
+            continue
+        for t in proj.get("tarefas", []):
+            linhas.append({col: t.get(col) for col in COLUNAS_SHAREPOINT})
+
+    df = pd.DataFrame(linhas, columns=COLUNAS_SHAREPOINT)
+
+    # Converte colunas de data para datetime real
+    for col in ("Inicio", "Termino", "InicioReal", "TerminoReal", "DataProcessamento"):
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce")
+
+    # Numéricos
+    for col in ("PercentualConcluido", "Duracao", "CustoPrevisto", "CustoRealizado", "UniqueID", "IdTarefaMae"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Cronogramas")
+    buf.seek(0)
+
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=cronogramas.xlsx"},
+    )
