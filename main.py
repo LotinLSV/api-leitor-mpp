@@ -118,11 +118,19 @@ def safe_date(value: Any) -> Optional[str]:
 # ------------------------------------------------------------------
 # INICIA JVM (MPXJ)
 # ------------------------------------------------------------------
+# if not jpype.isJVMStarted():
+#     jpype.startJVM(classpath=[
+#         "/app/libs/mpxj.jar",
+#         "/app/libs/mpxj-deps.jar",
+#     ])
+
 if not jpype.isJVMStarted():
-    jpype.startJVM(classpath=[
-        "/app/libs/mpxj.jar",
-        "/app/libs/mpxj-deps.jar",
-    ])
+    jpype.startJVM(
+        "-Xms64m",
+        "-Xmx320m",
+        "-XX:+UseSerialGC",
+        classpath=["/app/libs/mpxj.jar"],
+    )
 
 
 # if not jpype.isJVMStarted():
